@@ -12,8 +12,8 @@ use tokio::sync::mpsc;
 use zaz::cli::{Cli, Commands};
 use zaz_config::{load_user_config, TuiStylePreference, UserConfig};
 use zaz_daemon::{
-    resolve_socket, resolve_workspace_socket, socket_path_for_config, ApiRequest, ApiResponse,
-    Client, DaemonError, Engine, EngineCommand, Server,
+    resolve_target, resolve_workspace_socket, ApiRequest, ApiResponse, Client, ConfigOrigin,
+    DaemonError, DaemonTarget, Engine, EngineCommand, Server,
 };
 use zaz_mcp::McpError;
 use zaz_process::{DaemonLauncher, LaunchHandle};
@@ -464,8 +464,8 @@ async fn try_main() -> Result<()> {
             _log_guard = init_tracing(cli.debug, false, cli.log_file.as_deref());
             let config = at_most_one_config(&cli.config)?;
             let config_path = find_config(&config)?;
-            let socket_path = resolve_command_socket(&config, cli.socket.clone(), &current_dir)?;
-            run_daemon(&config_path, &socket_path, quiet).await
+            let target = resolve_command_target(&config, cli.socket.clone(), &current_dir)?;
+            run_daemon(&config_path, target.socket(), quiet).await
         }
         Some(Commands::Start) => {
             let daemon_log_file =
@@ -494,11 +494,10 @@ async fn try_main() -> Result<()> {
             } else {
                 let config = at_most_one_config(&cli.config)?;
                 let config_path = find_config(&config)?;
-                let socket_path =
-                    resolve_command_socket(&config, cli.socket.clone(), &current_dir)?;
+                let target = resolve_command_target(&config, cli.socket.clone(), &current_dir)?;
                 start_daemon_command(
                     &config_path,
-                    &socket_path,
+                    target.socket(),
                     cli.debug,
                     daemon_log_file.as_deref(),
                     &daemon_output_log,
@@ -515,42 +514,42 @@ async fn try_main() -> Result<()> {
         Some(Commands::Status) => {
             prepare_log_files(&explicit_log_paths)?;
             _log_guard = init_tracing(cli.debug, false, cli.log_file.as_deref());
-            let socket_path = resolve_control_command_socket(
+            let target = resolve_command_target(
                 &at_most_one_config(&cli.config)?,
                 cli.socket.clone(),
                 &current_dir,
             )?;
-            show_status(&socket_path).await
+            show_status(&target).await
         }
         Some(Commands::Restart { group }) => {
             prepare_log_files(&explicit_log_paths)?;
             _log_guard = init_tracing(cli.debug, false, cli.log_file.as_deref());
-            let socket_path = resolve_control_command_socket(
+            let target = resolve_command_target(
                 &at_most_one_config(&cli.config)?,
                 cli.socket.clone(),
                 &current_dir,
             )?;
-            restart(&socket_path, group).await
+            restart(&target, group).await
         }
         Some(Commands::Stop) => {
             prepare_log_files(&explicit_log_paths)?;
             _log_guard = init_tracing(cli.debug, false, cli.log_file.as_deref());
-            let socket_path = resolve_control_command_socket(
+            let target = resolve_command_target(
                 &at_most_one_config(&cli.config)?,
                 cli.socket.clone(),
                 &current_dir,
             )?;
-            stop_daemon(&socket_path).await
+            stop_daemon(&target).await
         }
         Some(Commands::Reload) => {
             prepare_log_files(&explicit_log_paths)?;
             _log_guard = init_tracing(cli.debug, false, cli.log_file.as_deref());
-            let socket_path = resolve_control_command_socket(
+            let target = resolve_command_target(
                 &at_most_one_config(&cli.config)?,
                 cli.socket.clone(),
                 &current_dir,
             )?;
-            reload_config(&socket_path).await
+            reload_config(&target).await
         }
         Some(Commands::Check { config, json }) => {
             prepare_log_files(&explicit_log_paths)?;
@@ -565,7 +564,8 @@ async fn try_main() -> Result<()> {
         }
         Some(Commands::Mcp { autostart }) => {
             let config = at_most_one_config(&cli.config)?;
-            let socket_path = resolve_command_socket(&config, cli.socket.clone(), &current_dir)?;
+            let target = resolve_command_target(&config, cli.socket.clone(), &current_dir)?;
+            let socket_path = target.socket().to_path_buf();
 
             if autostart {
                 let config_path = find_config(&config)?;
@@ -649,7 +649,7 @@ async fn try_main() -> Result<()> {
         None => {
             let config = at_most_one_config(&cli.config)?;
             let config_path = find_config(&config)?;
-            let socket_path = resolve_command_socket(&config, cli.socket.clone(), &current_dir)?;
+            let target = resolve_command_target(&config, cli.socket.clone(), &current_dir)?;
             let tui_log_file = resolve_tui_log_file(cli.debug, cli.log_file.as_deref())?;
             let daemon_log_file =
                 resolve_autostart_daemon_log_file(cli.debug, cli.log_file.as_deref())?;
@@ -668,7 +668,7 @@ async fn try_main() -> Result<()> {
             let tui_options = TuiOptions::from_cli_and_user_config(&cli, &user_config);
             run_tui(
                 &config_path,
-                &socket_path,
+                target.socket(),
                 &tui_options,
                 cli.debug,
                 daemon_log_file.as_deref(),
@@ -691,17 +691,17 @@ impl fmt::Display for StatusNotRunning {
 impl std::error::Error for StatusNotRunning {}
 
 /// Operator-facing error raised when a daemon-API verb cannot reach the daemon
-/// because no socket is listening. Carries the socket path that was tried and
-/// exposes a structured recovery hint for the top-level error printer.
+/// because no socket is listening. Carries the target that was tried and exposes
+/// a structured recovery hint for the top-level error printer.
 #[derive(Debug, Clone)]
 struct NoDaemon {
-    socket_path: PathBuf,
+    target: DaemonTarget,
 }
 
 impl NoDaemon {
-    fn new(socket_path: &Path) -> Self {
+    fn new(target: &DaemonTarget) -> Self {
         Self {
-            socket_path: socket_path.to_path_buf(),
+            target: target.clone(),
         }
     }
 
@@ -712,19 +712,19 @@ impl NoDaemon {
 
 impl fmt::Display for NoDaemon {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "no daemon running at {}", self.socket_path.display())
+        write!(f, "no daemon running at {}", self.target.socket().display())
     }
 }
 
 impl std::error::Error for NoDaemon {}
 
-/// Connect to the daemon at `socket_path`. On connection failure, returns a
+/// Connect to the daemon `target` addresses. On connection failure, returns a
 /// `NoDaemon` error wrapped via `anyhow::Error` so the top-level printer can
 /// surface its recovery hint.
-async fn connect_or_no_daemon(socket_path: &Path) -> Result<Client> {
-    Client::connect(socket_path)
+async fn connect_or_no_daemon(target: &DaemonTarget) -> Result<Client> {
+    Client::connect(target.socket())
         .await
-        .map_err(|_| anyhow::Error::from(NoDaemon::new(socket_path)))
+        .map_err(|_| anyhow::Error::from(NoDaemon::new(target)))
 }
 
 /// Render the daemon's response to a control-plane verb: print the success
@@ -774,29 +774,27 @@ fn find_config(explicit: &Option<PathBuf>) -> Result<PathBuf> {
     }
 }
 
-fn resolve_control_command_socket(
+/// Resolve the daemon a command invocation addresses, keeping the provenance of
+/// every path so operator-facing messages can annotate what zaz derived and echo
+/// what the operator typed.
+fn resolve_command_target(
     explicit_config: &Option<PathBuf>,
     explicit_socket: Option<PathBuf>,
     start_dir: &Path,
-) -> Result<PathBuf> {
-    resolve_command_socket(explicit_config, explicit_socket, start_dir)
-}
-
-fn resolve_command_socket(
-    explicit_config: &Option<PathBuf>,
-    explicit_socket: Option<PathBuf>,
-    start_dir: &Path,
-) -> Result<PathBuf> {
+) -> Result<DaemonTarget> {
     if let Some(socket_path) = explicit_socket {
-        return Ok(socket_path);
+        return Ok(DaemonTarget::explicit(socket_path));
     }
 
     if explicit_config.is_some() {
         let config_path = find_config(explicit_config)?;
-        return Ok(socket_path_for_config(&config_path));
+        return Ok(DaemonTarget::for_config(
+            config_path,
+            ConfigOrigin::Explicit,
+        ));
     }
 
-    Ok(resolve_socket(None, start_dir)?)
+    Ok(resolve_target(None, start_dir)?)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1092,8 +1090,8 @@ async fn start_supervisor_command(
     }
 }
 
-async fn show_status(socket_path: &Path) -> Result<()> {
-    let mut client = match Client::connect(socket_path).await {
+async fn show_status(target: &DaemonTarget) -> Result<()> {
+    let mut client = match Client::connect(target.socket()).await {
         Ok(c) => c,
         Err(_) => {
             // Status's "no daemon" path bypasses the top-level error printer so
@@ -1101,7 +1099,7 @@ async fn show_status(socket_path: &Path) -> Result<()> {
             // and the process exits 3 via `StatusNotRunning`. Render the same
             // bare message + indented hint shape the printer produces for
             // stderr-routed errors.
-            let no_daemon = NoDaemon::new(socket_path);
+            let no_daemon = NoDaemon::new(target);
             println!("{}", no_daemon);
             println!("       hint: {}", no_daemon.hint());
             return Err(StatusNotRunning.into());
@@ -1142,8 +1140,8 @@ async fn show_status(socket_path: &Path) -> Result<()> {
     }
 }
 
-async fn restart(socket_path: &Path, group: Option<String>) -> Result<()> {
-    let mut client = connect_or_no_daemon(socket_path).await?;
+async fn restart(target: &DaemonTarget, group: Option<String>) -> Result<()> {
+    let mut client = connect_or_no_daemon(target).await?;
 
     let request = match group {
         Some(name) => ApiRequest::RestartGroup {
@@ -1157,8 +1155,8 @@ async fn restart(socket_path: &Path, group: Option<String>) -> Result<()> {
     handle_daemon_response(response, "restart", "OK")
 }
 
-async fn stop_daemon(socket_path: &Path) -> Result<()> {
-    let mut client = match Client::connect(socket_path).await {
+async fn stop_daemon(target: &DaemonTarget) -> Result<()> {
+    let mut client = match Client::connect(target.socket()).await {
         Ok(c) => c,
         Err(_) => {
             // Idempotent: a stop that finds no daemon exits 0.
@@ -1171,8 +1169,8 @@ async fn stop_daemon(socket_path: &Path) -> Result<()> {
     handle_daemon_response(response, "stop", "Shutdown initiated")
 }
 
-async fn reload_config(socket_path: &Path) -> Result<()> {
-    let mut client = connect_or_no_daemon(socket_path).await?;
+async fn reload_config(target: &DaemonTarget) -> Result<()> {
+    let mut client = connect_or_no_daemon(target).await?;
     let response = client.request(&ApiRequest::ReloadConfig).await?;
     handle_daemon_response(response, "reload", "Configuration reloaded")
 }
@@ -1733,13 +1731,13 @@ mod tests {
 
     #[test]
     fn no_daemon_display_includes_socket_path() {
-        let nd = NoDaemon::new(Path::new("/tmp/zaz.sock"));
+        let nd = NoDaemon::new(&DaemonTarget::explicit(PathBuf::from("/tmp/zaz.sock")));
         assert_eq!(nd.to_string(), "no daemon running at /tmp/zaz.sock");
     }
 
     #[test]
     fn no_daemon_hint_points_at_zaz_start_and_socket_flag() {
-        let nd = NoDaemon::new(Path::new("/tmp/zaz.sock"));
+        let nd = NoDaemon::new(&DaemonTarget::explicit(PathBuf::from("/tmp/zaz.sock")));
         assert_eq!(
             nd.hint(),
             "start a daemon with `zaz start`, or set --socket <PATH> if the daemon is running on a different socket"
@@ -1760,7 +1758,8 @@ mod tests {
 
     #[test]
     fn error_hint_surfaces_no_daemon_recovery() {
-        let err: anyhow::Error = NoDaemon::new(Path::new("/tmp/zaz.sock")).into();
+        let err: anyhow::Error =
+            NoDaemon::new(&DaemonTarget::explicit(PathBuf::from("/tmp/zaz.sock"))).into();
         assert_eq!(
             error_hint(&err).as_deref(),
             Some("start a daemon with `zaz start`, or set --socket <PATH> if the daemon is running on a different socket")
@@ -1947,41 +1946,25 @@ mod tests {
     }
 
     #[test]
-    fn control_command_socket_uses_explicit_socket() -> Result<()> {
+    fn command_target_uses_explicit_socket() -> Result<()> {
         let temp = TempDir::new()?;
         let config_path = temp.path().join("zaz.toml");
         std::fs::write(&config_path, "")?;
 
         let explicit_socket = temp.path().join("explicit.sock");
-        let resolved = resolve_control_command_socket(
+        let target = resolve_command_target(
             &Some(config_path),
             Some(explicit_socket.clone()),
             temp.path(),
         )?;
 
-        assert_eq!(resolved, explicit_socket);
+        assert_eq!(target, DaemonTarget::explicit(explicit_socket));
+        assert_eq!(target.config(), None);
         Ok(())
     }
 
     #[test]
-    fn command_socket_uses_explicit_socket() -> Result<()> {
-        let temp = TempDir::new()?;
-        let config_path = temp.path().join("zaz.toml");
-        std::fs::write(&config_path, "")?;
-
-        let explicit_socket = temp.path().join("explicit.sock");
-        let resolved = resolve_command_socket(
-            &Some(config_path),
-            Some(explicit_socket.clone()),
-            temp.path(),
-        )?;
-
-        assert_eq!(resolved, explicit_socket);
-        Ok(())
-    }
-
-    #[test]
-    fn command_socket_uses_explicit_config() -> Result<()> {
+    fn command_target_uses_explicit_config() -> Result<()> {
         let temp = TempDir::new()?;
         let project_dir = temp.path().join("project");
         let elsewhere = temp.path().join("elsewhere");
@@ -1991,14 +1974,30 @@ mod tests {
         let config_path = project_dir.join("zaz.toml");
         std::fs::write(&config_path, "")?;
 
-        let resolved = resolve_command_socket(&Some(config_path.clone()), None, &elsewhere)?;
+        let target = resolve_command_target(&Some(config_path.clone()), None, &elsewhere)?;
 
-        assert_eq!(resolved, socket_path_for_config(&config_path));
+        assert_eq!(target.socket(), socket_path_for_config(&config_path));
+        assert_eq!(target.config(), Some(config_path.as_path()));
+        assert_eq!(target.config_origin(), Some(ConfigOrigin::Explicit));
         Ok(())
     }
 
     #[test]
-    fn command_socket_discovers_project_from_start_dir() -> Result<()> {
+    fn command_target_finds_config_in_start_dir() -> Result<()> {
+        let temp = TempDir::new()?;
+        let config_path = temp.path().join("zaz.toml");
+        std::fs::write(&config_path, "")?;
+
+        let target = resolve_command_target(&None, None, temp.path())?;
+
+        assert_eq!(target.socket(), socket_path_for_config(&config_path));
+        assert_eq!(target.config(), Some(config_path.as_path()));
+        assert_eq!(target.config_origin(), Some(ConfigOrigin::CurrentDir));
+        Ok(())
+    }
+
+    #[test]
+    fn command_target_discovers_project_above_start_dir() -> Result<()> {
         let temp = TempDir::new()?;
         let config_path = temp.path().join("zaz.toml");
         std::fs::write(&config_path, "")?;
@@ -2006,77 +2005,21 @@ mod tests {
         let nested = temp.path().join("a/b/c");
         std::fs::create_dir_all(&nested)?;
 
-        let resolved = resolve_command_socket(&None, None, &nested)?;
+        let target = resolve_command_target(&None, None, &nested)?;
 
-        assert_eq!(resolved, socket_path_for_config(&config_path));
+        assert_eq!(target.socket(), socket_path_for_config(&config_path));
+        assert_eq!(target.config(), Some(config_path.as_path()));
+        assert_eq!(target.config_origin(), Some(ConfigOrigin::Upward));
         Ok(())
     }
 
     #[test]
-    fn command_socket_errors_outside_project_without_socket() -> Result<()> {
+    fn command_target_errors_outside_project_without_socket() -> Result<()> {
         let temp = TempDir::new()?;
         let outside = temp.path().join("outside");
         std::fs::create_dir_all(&outside)?;
 
-        let err = resolve_command_socket(&None, None, &outside).unwrap_err();
-        let daemon_err = err.downcast_ref::<DaemonError>().expect("daemon error");
-
-        match daemon_err {
-            DaemonError::SocketResolution { start_dir } => {
-                assert_eq!(start_dir, &PathBuf::from(&outside));
-            }
-            other => panic!("expected socket resolution error, got {:?}", other),
-        }
-
-        let message = err.to_string();
-        assert!(message.contains("could not resolve daemon socket from"));
-        assert_eq!(
-            daemon_err.hint(),
-            Some("run this command from a zaz project directory or pass --socket <PATH>")
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn control_command_socket_uses_explicit_config() -> Result<()> {
-        let temp = TempDir::new()?;
-        let project_dir = temp.path().join("project");
-        let elsewhere = temp.path().join("elsewhere");
-        std::fs::create_dir_all(&project_dir)?;
-        std::fs::create_dir_all(&elsewhere)?;
-
-        let config_path = project_dir.join("zaz.toml");
-        std::fs::write(&config_path, "")?;
-
-        let resolved =
-            resolve_control_command_socket(&Some(config_path.clone()), None, &elsewhere)?;
-
-        assert_eq!(resolved, socket_path_for_config(&config_path));
-        Ok(())
-    }
-
-    #[test]
-    fn control_command_socket_discovers_project_from_start_dir() -> Result<()> {
-        let temp = TempDir::new()?;
-        let config_path = temp.path().join("zaz.toml");
-        std::fs::write(&config_path, "")?;
-
-        let nested = temp.path().join("a/b/c");
-        std::fs::create_dir_all(&nested)?;
-
-        let resolved = resolve_control_command_socket(&None, None, &nested)?;
-
-        assert_eq!(resolved, socket_path_for_config(&config_path));
-        Ok(())
-    }
-
-    #[test]
-    fn control_command_socket_errors_outside_project_without_socket() -> Result<()> {
-        let temp = TempDir::new()?;
-        let outside = temp.path().join("outside");
-        std::fs::create_dir_all(&outside)?;
-
-        let err = resolve_control_command_socket(&None, None, &outside).unwrap_err();
+        let err = resolve_command_target(&None, None, &outside).unwrap_err();
         let daemon_err = err.downcast_ref::<DaemonError>().expect("daemon error");
 
         match daemon_err {
