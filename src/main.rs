@@ -421,27 +421,64 @@ fn error_hint(err: &anyhow::Error) -> Option<String> {
     None
 }
 
+/// Walk an `anyhow::Error` chain and return the labeled lines the first
+/// annotated cause wants printed between its message and its hint.
+///
+/// An annotation explains a value zaz derived on the operator's behalf. A value
+/// the operator typed is echoed in the message and left alone.
+fn error_annotations(err: &anyhow::Error) -> Vec<(&'static str, String)> {
+    for cause in err.chain() {
+        if let Some(nd) = cause.downcast_ref::<NoDaemon>() {
+            return nd.annotations();
+        }
+    }
+    Vec::new()
+}
+
+/// Width of the label column in an operator-facing error block.
+///
+/// `hint` is the label ZAZ-009 established, and every later label right-aligns
+/// to the same colon so a block with three annotations reads as one paragraph.
+const ERROR_LABEL_WIDTH: usize = "       hint".len();
+
+/// Render one labeled continuation line under an error's first line.
+///
+/// Padding is measured by hand rather than through a format width, because a
+/// painted label carries ANSI bytes that the width would count as characters.
+fn labeled_line(label: &str, value: &str, colored: bool) -> String {
+    use yansi::Paint;
+
+    let pad = " ".repeat(ERROR_LABEL_WIDTH.saturating_sub(label.len()));
+    if colored {
+        format!("{pad}{}: {value}", label.cyan().bold())
+    } else {
+        format!("{pad}{label}: {value}")
+    }
+}
+
 /// Print an operator-facing error to stderr in the same shape as
-/// `check_config`'s validation printer: an `Error: <message>` line, and a
-/// `       hint: <recovery>` line indented underneath when the underlying
-/// error type provides one. Labels are styled when stderr is a TTY and emitted
-/// as plain text otherwise so the output remains substring-searchable for
-/// scripted consumers.
+/// `check_config`'s validation printer: an `Error: <message>` line, any labeled
+/// annotation lines the error carries, and a `       hint: <recovery>` line
+/// underneath when the underlying error type provides one. Labels are styled
+/// when stderr is a TTY and emitted as plain text otherwise so the output
+/// remains substring-searchable for scripted consumers.
 fn report_error(err: &anyhow::Error) {
     use std::io::IsTerminal;
     use yansi::Paint;
 
-    let hint = error_hint(err);
-    if std::io::stderr().is_terminal() {
+    let colored = std::io::stderr().is_terminal();
+    if colored {
         eprintln!("{}: {}", "Error".red().bold(), err);
-        if let Some(hint) = hint {
-            eprintln!("       {}: {}", "hint".cyan().bold(), hint);
-        }
     } else {
         eprintln!("Error: {err}");
-        if let Some(hint) = hint {
-            eprintln!("       hint: {hint}");
-        }
+    }
+
+    for (label, value) in error_annotations(err) {
+        eprintln!("{}", labeled_line(label, &value, colored));
+    }
+
+    if let Some(hint) = error_hint(err) {
+        eprintln!("{}", labeled_line("hint", &hint, colored));
     }
 }
 
@@ -705,18 +742,70 @@ impl NoDaemon {
         }
     }
 
+    /// The labeled lines explaining the values zaz derived.
+    ///
+    /// An operator who passed `--socket` derived nothing, so there is nothing to
+    /// explain. A config sitting in the directory they are standing in explains
+    /// itself, because the printed path already ends there.
+    fn annotations(&self) -> Vec<(&'static str, String)> {
+        let mut lines = Vec::new();
+
+        if self.target.config().is_some() {
+            lines.push(("socket", self.target.socket().display().to_string()));
+        }
+
+        if self.target.config_origin() == Some(ConfigOrigin::Upward) {
+            lines.push((
+                "config",
+                "found by searching upward from the current directory".to_string(),
+            ));
+        }
+
+        lines
+    }
+
     fn hint(&self) -> &'static str {
-        "start a daemon with `zaz start`, or set --socket <PATH> if the daemon is running on a different socket"
+        "start one with `zaz start`"
     }
 }
 
 impl fmt::Display for NoDaemon {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "no daemon running at {}", self.target.socket().display())
+        match self.target.config() {
+            Some(config) => write!(f, "no daemon running for {}", config.display()),
+            None => write!(f, "no daemon running at {}", self.target.socket().display()),
+        }
     }
 }
 
 impl std::error::Error for NoDaemon {}
+
+/// Whether a no-daemon block printed on stdout ends with the recovery hint.
+enum NoDaemonHint {
+    Show,
+    Omit,
+}
+
+/// Print a no-daemon block on stdout.
+///
+/// `status` and `stop` both report an absent daemon as an outcome rather than a
+/// failure, so their block bypasses the stderr error printer while keeping its
+/// shape. `stop` omits the hint: an operator who asked to stop a daemon has no
+/// use for a suggestion to start one.
+fn print_no_daemon(no_daemon: &NoDaemon, hint: NoDaemonHint) {
+    use std::io::IsTerminal;
+
+    let colored = std::io::stdout().is_terminal();
+    println!("{no_daemon}");
+
+    for (label, value) in no_daemon.annotations() {
+        println!("{}", labeled_line(label, &value, colored));
+    }
+
+    if matches!(hint, NoDaemonHint::Show) {
+        println!("{}", labeled_line("hint", no_daemon.hint(), colored));
+    }
+}
 
 /// Connect to the daemon `target` addresses. On connection failure, returns a
 /// `NoDaemon` error wrapped via `anyhow::Error` so the top-level printer can
@@ -1094,14 +1183,9 @@ async fn show_status(target: &DaemonTarget) -> Result<()> {
     let mut client = match Client::connect(target.socket()).await {
         Ok(c) => c,
         Err(_) => {
-            // Status's "no daemon" path bypasses the top-level error printer so
-            // the message lands on stdout (per ZAZ-005 query-command semantics)
-            // and the process exits 3 via `StatusNotRunning`. Render the same
-            // bare message + indented hint shape the printer produces for
-            // stderr-routed errors.
-            let no_daemon = NoDaemon::new(target);
-            println!("{}", no_daemon);
-            println!("       hint: {}", no_daemon.hint());
+            // Status's "no daemon" path lands on stdout per ZAZ-005 query-command
+            // semantics, and the process exits 3 via `StatusNotRunning`.
+            print_no_daemon(&NoDaemon::new(target), NoDaemonHint::Show);
             return Err(StatusNotRunning.into());
         }
     };
@@ -1160,7 +1244,7 @@ async fn stop_daemon(target: &DaemonTarget) -> Result<()> {
         Ok(c) => c,
         Err(_) => {
             // Idempotent: a stop that finds no daemon exits 0.
-            println!("No daemon running");
+            print_no_daemon(&NoDaemon::new(target), NoDaemonHint::Omit);
             return Ok(());
         }
     };
@@ -1730,18 +1814,98 @@ mod tests {
     }
 
     #[test]
-    fn no_daemon_display_includes_socket_path() {
+    fn no_daemon_display_echoes_an_explicit_socket() {
         let nd = NoDaemon::new(&DaemonTarget::explicit(PathBuf::from("/tmp/zaz.sock")));
         assert_eq!(nd.to_string(), "no daemon running at /tmp/zaz.sock");
     }
 
     #[test]
-    fn no_daemon_hint_points_at_zaz_start_and_socket_flag() {
-        let nd = NoDaemon::new(&DaemonTarget::explicit(PathBuf::from("/tmp/zaz.sock")));
-        assert_eq!(
-            nd.hint(),
-            "start a daemon with `zaz start`, or set --socket <PATH> if the daemon is running on a different socket"
+    fn no_daemon_display_names_the_config_the_socket_came_from() {
+        let target = DaemonTarget::for_config(
+            PathBuf::from("/tmp/project/zaz.toml"),
+            ConfigOrigin::CurrentDir,
         );
+        let nd = NoDaemon::new(&target);
+        assert_eq!(
+            nd.to_string(),
+            "no daemon running for /tmp/project/zaz.toml"
+        );
+    }
+
+    #[test]
+    fn no_daemon_explains_nothing_for_an_explicit_socket() {
+        let nd = NoDaemon::new(&DaemonTarget::explicit(PathBuf::from("/tmp/zaz.sock")));
+        assert!(nd.annotations().is_empty());
+    }
+
+    #[test]
+    fn no_daemon_shows_the_socket_for_a_config_the_operator_named() {
+        let config = PathBuf::from("/tmp/project/zaz.toml");
+        let target = DaemonTarget::for_config(config.clone(), ConfigOrigin::Explicit);
+        let nd = NoDaemon::new(&target);
+
+        assert_eq!(
+            nd.annotations(),
+            vec![(
+                "socket",
+                socket_path_for_config(&config).display().to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn no_daemon_shows_the_socket_for_a_config_in_the_current_directory() {
+        let config = PathBuf::from("/tmp/project/zaz.toml");
+        let target = DaemonTarget::for_config(config.clone(), ConfigOrigin::CurrentDir);
+        let nd = NoDaemon::new(&target);
+
+        assert_eq!(
+            nd.annotations(),
+            vec![(
+                "socket",
+                socket_path_for_config(&config).display().to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn no_daemon_explains_a_config_found_by_the_upward_walk() {
+        let config = PathBuf::from("/tmp/project/zaz.toml");
+        let target = DaemonTarget::for_config(config.clone(), ConfigOrigin::Upward);
+        let nd = NoDaemon::new(&target);
+
+        assert_eq!(
+            nd.annotations(),
+            vec![
+                (
+                    "socket",
+                    socket_path_for_config(&config).display().to_string()
+                ),
+                (
+                    "config",
+                    "found by searching upward from the current directory".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn no_daemon_hint_points_at_zaz_start() {
+        let nd = NoDaemon::new(&DaemonTarget::explicit(PathBuf::from("/tmp/zaz.sock")));
+        assert_eq!(nd.hint(), "start one with `zaz start`");
+    }
+
+    #[test]
+    fn labeled_lines_share_the_hint_column() {
+        let socket = labeled_line("socket", "/tmp/zaz.sock", false);
+        let config = labeled_line("config", "found by searching upward", false);
+        let hint = labeled_line("hint", "start one with `zaz start`", false);
+
+        assert_eq!(socket.find(':'), Some(ERROR_LABEL_WIDTH));
+        assert_eq!(config.find(':'), Some(ERROR_LABEL_WIDTH));
+        assert_eq!(hint.find(':'), Some(ERROR_LABEL_WIDTH));
+        assert!(socket.starts_with("     socket: "));
+        assert!(hint.starts_with("       hint: "));
     }
 
     #[test]
@@ -1762,8 +1926,27 @@ mod tests {
             NoDaemon::new(&DaemonTarget::explicit(PathBuf::from("/tmp/zaz.sock"))).into();
         assert_eq!(
             error_hint(&err).as_deref(),
-            Some("start a daemon with `zaz start`, or set --socket <PATH> if the daemon is running on a different socket")
+            Some("start one with `zaz start`")
         );
+    }
+
+    #[test]
+    fn error_annotations_surface_no_daemon_provenance() {
+        let target =
+            DaemonTarget::for_config(PathBuf::from("/tmp/project/zaz.toml"), ConfigOrigin::Upward);
+        let err: anyhow::Error = NoDaemon::new(&target).into();
+        let labels: Vec<&str> = error_annotations(&err)
+            .iter()
+            .map(|(label, _)| *label)
+            .collect();
+
+        assert_eq!(labels, vec!["socket", "config"]);
+    }
+
+    #[test]
+    fn error_annotations_are_empty_when_no_annotated_error_in_chain() {
+        let err = anyhow::anyhow!("some plain error");
+        assert!(error_annotations(&err).is_empty());
     }
 
     #[test]
