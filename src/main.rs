@@ -10,10 +10,10 @@ use std::process::ExitStatus;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use zaz::cli::{Cli, Commands};
-use zaz_config::{load_user_config, TuiStylePreference, UserConfig};
+use zaz_config::{load_user_config, ConfigError, TuiStylePreference, UserConfig};
 use zaz_daemon::{
-    resolve_target, resolve_workspace_socket, ApiRequest, ApiResponse, Client, ConfigOrigin,
-    DaemonError, DaemonTarget, Engine, EngineCommand, Server,
+    discover_config_upward, resolve_target, resolve_workspace_socket, ApiRequest, ApiResponse,
+    Client, ConfigOrigin, DaemonError, DaemonTarget, Engine, EngineCommand, Server,
 };
 use zaz_mcp::McpError;
 use zaz_process::{DaemonLauncher, LaunchHandle};
@@ -401,7 +401,7 @@ async fn main() {
 
 /// Walk an `anyhow::Error` chain and return the first structured recovery hint
 /// it carries, if any. Recognized error types: [`DaemonError`], [`McpError`],
-/// [`NoDaemon`], and `zaz_config::ValidationError`.
+/// [`NoDaemon`], and [`ConfigError`].
 fn error_hint(err: &anyhow::Error) -> Option<String> {
     for cause in err.chain() {
         if let Some(de) = cause.downcast_ref::<DaemonError>() {
@@ -416,6 +416,11 @@ fn error_hint(err: &anyhow::Error) -> Option<String> {
         }
         if let Some(nd) = cause.downcast_ref::<NoDaemon>() {
             return Some(nd.hint().to_string());
+        }
+        if let Some(ce) = cause.downcast_ref::<ConfigError>() {
+            if let Some(h) = ce.hint() {
+                return Some(h.to_string());
+            }
         }
     }
     None
@@ -493,14 +498,14 @@ async fn try_main() -> Result<()> {
             prepare_log_files(&explicit_log_paths)?;
             _log_guard = init_tracing(cli.debug, false, cli.log_file.as_deref());
             let config = at_most_one_config(&cli.config)?;
-            let config_path = find_config(&config)?;
+            let config_path = find_config(&config, &current_dir)?;
             run_tasks(&config_path).await
         }
         Some(Commands::Daemon { quiet }) => {
             prepare_log_files(&explicit_log_paths)?;
             _log_guard = init_tracing(cli.debug, false, cli.log_file.as_deref());
             let config = at_most_one_config(&cli.config)?;
-            let config_path = find_config(&config)?;
+            let config_path = find_config(&config, &current_dir)?;
             let target = resolve_command_target(&config, cli.socket.clone(), &current_dir)?;
             run_daemon(&config_path, target.socket(), quiet).await
         }
@@ -530,7 +535,7 @@ async fn try_main() -> Result<()> {
                 .await
             } else {
                 let config = at_most_one_config(&cli.config)?;
-                let config_path = find_config(&config)?;
+                let config_path = find_config(&config, &current_dir)?;
                 let target = resolve_command_target(&config, cli.socket.clone(), &current_dir)?;
                 start_daemon_command(
                     &config_path,
@@ -591,7 +596,8 @@ async fn try_main() -> Result<()> {
         Some(Commands::Check { config, json }) => {
             prepare_log_files(&explicit_log_paths)?;
             _log_guard = init_tracing(cli.debug, false, cli.log_file.as_deref());
-            let config_path = find_config(&config.or(at_most_one_config(&cli.config)?))?;
+            let config_path =
+                find_config(&config.or(at_most_one_config(&cli.config)?), &current_dir)?;
             check_config(&config_path, json)
         }
         Some(Commands::Ignores) => {
@@ -605,7 +611,7 @@ async fn try_main() -> Result<()> {
             let socket_path = target.socket().to_path_buf();
 
             if autostart {
-                let config_path = find_config(&config)?;
+                let config_path = find_config(&config, &current_dir)?;
                 let daemon_log_file =
                     resolve_autostart_daemon_log_file(cli.debug, cli.log_file.as_deref())?;
                 let daemon_output_log =
@@ -685,7 +691,7 @@ async fn try_main() -> Result<()> {
         }
         None => {
             let config = at_most_one_config(&cli.config)?;
-            let config_path = find_config(&config)?;
+            let config_path = find_config(&config, &current_dir)?;
             let target = resolve_command_target(&config, cli.socket.clone(), &current_dir)?;
             let tui_log_file = resolve_tui_log_file(cli.debug, cli.log_file.as_deref())?;
             let daemon_log_file =
@@ -848,7 +854,14 @@ fn at_most_one_config(configs: &[PathBuf]) -> Result<Option<PathBuf>> {
     }
 }
 
-fn find_config(explicit: &Option<PathBuf>) -> Result<PathBuf> {
+/// Resolve the config a subcommand operates on.
+///
+/// An explicit `--config` is echoed back after an existence check. Otherwise the
+/// search starts at `start_dir` and walks upward, the same route `resolve_target`
+/// takes to address a daemon. Sharing that walk is what lets a subdirectory of a
+/// project resolve the project. Without it a recovery hint can name a command
+/// that then refuses from the directory it was suggested in.
+fn find_config(explicit: &Option<PathBuf>, start_dir: &Path) -> Result<PathBuf> {
     if let Some(path) = explicit {
         if path.exists() {
             return Ok(path.clone());
@@ -856,11 +869,12 @@ fn find_config(explicit: &Option<PathBuf>) -> Result<PathBuf> {
         anyhow::bail!("config file not found: {}", path.display());
     }
 
-    // Try to discover config file
-    match zaz_config::discover() {
-        Ok((path, _)) => Ok(path),
-        Err(e) => anyhow::bail!("no config file found: {}", e),
-    }
+    discover_config_upward(start_dir).ok_or_else(|| {
+        anyhow::Error::from(ConfigError::NotFound {
+            start_dir: start_dir.to_path_buf(),
+            filenames: zaz_config::CONFIG_FILES,
+        })
+    })
 }
 
 /// Resolve the daemon a command invocation addresses, keeping the provenance of
@@ -876,7 +890,7 @@ fn resolve_command_target(
     }
 
     if explicit_config.is_some() {
-        let config_path = find_config(explicit_config)?;
+        let config_path = find_config(explicit_config, start_dir)?;
         return Ok(DaemonTarget::for_config(
             config_path,
             ConfigOrigin::Explicit,
@@ -2217,6 +2231,60 @@ mod tests {
         assert_eq!(
             daemon_err.hint(),
             Some("run this command from a zaz project directory or pass --socket <PATH>")
+        );
+        Ok(())
+    }
+
+    /// `zaz`, `zaz task`, `zaz daemon`, `zaz start`, `zaz check`, and
+    /// `zaz mcp --autostart` all route their config through this one call.
+    ///
+    /// Bare `zaz` opens a TUI and never terminates on its own, so this is the
+    /// only coverage it gets. The rest are also asserted end to end.
+    #[test]
+    fn find_config_discovers_project_above_start_dir() -> Result<()> {
+        let temp = TempDir::new()?;
+        let config_path = temp.path().join("zaz.toml");
+        std::fs::write(&config_path, "")?;
+
+        let nested = temp.path().join("a/b/c");
+        std::fs::create_dir_all(&nested)?;
+
+        assert_eq!(find_config(&None, &nested)?, config_path);
+        Ok(())
+    }
+
+    #[test]
+    fn find_config_prefers_the_config_in_the_start_dir() -> Result<()> {
+        let temp = TempDir::new()?;
+        std::fs::write(temp.path().join("zaz.toml"), "")?;
+
+        let nested = temp.path().join("nested");
+        std::fs::create_dir_all(&nested)?;
+        let nested_config = nested.join("zaz.toml");
+        std::fs::write(&nested_config, "")?;
+
+        assert_eq!(find_config(&None, &nested)?, nested_config);
+        Ok(())
+    }
+
+    #[test]
+    fn find_config_names_the_start_dir_and_filenames_when_nothing_is_found() -> Result<()> {
+        let temp = TempDir::new()?;
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&outside)?;
+
+        let err = find_config(&None, &outside).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "no zaz.toml or zaz.json found in {} or any parent directory",
+                outside.display()
+            )
+        );
+        assert_eq!(
+            error_hint(&err).as_deref(),
+            Some("create one, or pass --config <PATH>")
         );
         Ok(())
     }
