@@ -1756,13 +1756,7 @@ async fn run_tui(
 
     // Connect to daemon
     tracing::debug!(socket = %socket_path.display(), "connecting TUI app to daemon");
-    if let Err(e) = app.connect(socket_path).await {
-        tracing::warn!(
-            socket = %socket_path.display(),
-            error = %e,
-            "failed to connect TUI app to daemon"
-        );
-    }
+    app.connect(socket_path).await;
 
     // Run TUI
     let result = app.run();
