@@ -77,6 +77,45 @@ fn check_validates_the_project_config_from_a_nested_directory() {
 }
 
 #[test]
+fn tui_reports_an_invalid_project_config_instead_of_autostarting() {
+    let temp = TempDir::new().unwrap();
+    let project = project(&temp);
+    let nested = nested_dir(&project);
+    std::fs::write(
+        &project.config,
+        r#"
+[[group]]
+name = "tasks"
+patterns = ["**/*.rs"]
+
+[[group.task]]
+name = "run"
+command = "true"
+
+[[group.task]]
+name = "run"
+command = "true"
+"#,
+    )
+    .unwrap();
+    let log_file = root(&temp).join("logs/tui.log");
+
+    let output = run_zaz(&nested, &["--log-file", &text_of(&log_file)]);
+
+    let stderr = stderr_string(&output);
+    assert_ne!(output.status.code(), Some(0));
+    assert!(
+        stderr.contains(&format!("invalid config {}: ", text_of(&project.config))),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("duplicate task name 'run'"),
+        "stderr: {stderr}"
+    );
+    assert!(!project.socket.exists());
+}
+
+#[test]
 fn task_runs_the_project_config_from_a_nested_directory() {
     let temp = TempDir::new().unwrap();
     let project = project(&temp);

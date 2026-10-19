@@ -284,10 +284,17 @@ The TUI is documented in [tui.md](tui.md), including styles, keyboard
 shortcuts, and filter/search semantics. `--full` and `--multi-pane` choose a
 style at launch and override any user-config preference.
 
-The TUI has no connect-failure message. It opens whether or not a daemon
-answers, and connects in the background with a retry loop. An absent daemon
-surfaces only in the status bar, which holds a red `○` and `Connecting...`
-until one appears; see [Status bar](tui.md#status-bar). Run `zaz status` for
+Before autostarting, `zaz` loads and validates the config. An invalid config
+fails the launch with the config's path and its error, and the TUI does not
+open. An
+autostarted daemon that exits before it answers also fails the launch, naming
+the daemon output log. Neither check runs when a daemon is already answering
+on the socket.
+
+Past those checks, the TUI has no connect-failure message. It opens whether
+or not a daemon answers, and connects in the background with a retry loop. An
+absent daemon surfaces only in the status bar, which holds a red `○` and
+`Connecting...` until one appears; see [Status bar](tui.md#status-bar). Run `zaz status` for
 the full no-daemon block naming the config and the socket it is waiting on.
 
 Examples:

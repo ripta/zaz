@@ -1661,6 +1661,18 @@ async fn run_tui(
     }
 
     if !daemon_running && !options.no_autostart {
+        // The daemon about to launch would die on an invalid config, and the TUI would then sit at
+        // `Connecting...` with the cause buried in the daemon's output log. Surface it here.
+        //
+        // An already-running daemon is attached to without this check. A config that is broken
+        // mid-edit is reported by that daemon's reload instead.
+        // `report_error` prints only the outermost message, so it repeats the cause after the path.
+        // The `ConfigError` stays in the chain for `error_hint`.
+        if let Err(e) = zaz_config::load(config_path) {
+            let message = format!("invalid config {}: {e}", config_path.display());
+            return Err(anyhow::Error::new(e).context(message));
+        }
+
         tracing::info!(
             socket = %socket_path.display(),
             daemon_log_file = daemon_log_file.map(|path| path.display().to_string()),
@@ -1696,11 +1708,23 @@ async fn run_tui(
                         );
                     }
                     Ok(DaemonReadyOutcome::Crashed(status)) => {
-                        tracing::warn!(
+                        // A concurrent `zaz` or `zaz start` can win the socket, which makes ours
+                        // exit as already running. Attach to the winner instead of failing.
+                        let availability =
+                            check_daemon_availability(socket_path, check_timeout).await;
+                        if availability != DaemonAvailability::Running {
+                            bail!(
+                                "daemon exited before becoming ready (status: {}); see {} for \
+                                 details",
+                                status,
+                                daemon_output_log.display()
+                            );
+                        }
+
+                        tracing::debug!(
                             socket = %socket_path.display(),
                             exit_status = %status,
-                            output_log = %daemon_output_log.display(),
-                            "auto-started daemon exited before becoming responsive"
+                            "auto-started daemon lost the socket to another daemon; attaching"
                         );
                     }
                     Ok(DaemonReadyOutcome::Timeout) => {
